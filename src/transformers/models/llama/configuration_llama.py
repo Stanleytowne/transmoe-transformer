@@ -171,6 +171,7 @@ class LlamaConfig(PretrainedConfig):
         is_converter=False,
         router_aux_loss_coef=1e-3,
         output_router_logits=False,
+        router_jitter_noise=0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -188,6 +189,7 @@ class LlamaConfig(PretrainedConfig):
         self.is_converter: bool = is_converter              # with the original mlp or not
         self.router_aux_loss_coef: float = router_aux_loss_coef
         self.output_router_logits: bool = output_router_logits
+        self.router_jitter_noise: float = router_jitter_noise
         # TODO: add support for moe layer manual configuration
         # e.g. leave the first two and the last two layers untouched
 
