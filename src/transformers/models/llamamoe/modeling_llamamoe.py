@@ -1522,7 +1522,6 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
         logger.info(f"Loading weights from pretrained Llama model {pretrained_model_name_or_path} and converting to LlamaMoe model")
         
         # Create LlamaMoe configuration, inheriting parameters from original Llama config
-        logger.info(f"Loading LlamaMoe configuration from pretrained Llama model {pretrained_model_name_or_path}")
         config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         assert config.architectures[0] == "LlamaForCausalLM", "The pretrained Llama model must be a LlamaForCausalLM model"
         config.architectures[0] = "LlamaMoeForCausalLM"
@@ -1532,17 +1531,14 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
         llama_model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, device_map="cpu")
         
         # Create LlamaMoe model
-        logger.info(f"Creating LlamaMoe model")
         model = cls(config)
         
         # Copy shared weights
-        logger.info(f"Copying shared weights")
         model.model.embed_tokens.weight.data = llama_model.model.embed_tokens.weight.data.clone()
         model.lm_head.weight.data = llama_model.lm_head.weight.data.clone()
         model.model.norm.weight.data = llama_model.model.norm.weight.data.clone()
         
         # Copy weights for non-MoE modules
-        logger.info(f"Copying weights for non-MoE modules")
         for i in range(config.num_hidden_layers):
             # Copy attention layer weights
             model.model.layers[i].self_attn.q_proj.weight.data = llama_model.model.layers[i].self_attn.q_proj.weight.data.clone()
@@ -1555,7 +1551,11 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
             model.model.layers[i].post_attention_layernorm.weight.data = llama_model.model.layers[i].post_attention_layernorm.weight.data.clone()
         
         # initialize moe router
-        logger.info(f"Initializing moe router")
+        if type(router_initialization_method) == float:
+            logger.warning(
+                f"Initializing moe router with standard deviation {router_initialization_method}.\nYou should probably"
+                " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
+            )
         for i, layer in enumerate(model.model.layers):
             module = layer.router
             device, dtype = module.weight.device, module.weight.dtype
@@ -1573,7 +1573,6 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
                 raise ValueError(f"Invalid router initialization method: {router_initialization_method}")
 
         # initialize moe experts
-        logger.info(f"Initializing moe experts")
         for i in range(0, model.config.num_hidden_layers, config.num_fused_layers):
             layers = llama_model.model.layers[i: i + config.num_fused_layers]
             experts = model.model.moe[i // config.num_fused_layers].experts
