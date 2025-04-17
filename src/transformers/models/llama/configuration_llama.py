@@ -166,8 +166,9 @@ class LlamaConfig(PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
-        num_fused_layer=4,
-        num_experts_per_tok=4,
+        num_fused_layers=4,
+        num_experts=16,
+        num_experts_per_tok=8,
         is_converter=False,
         router_aux_loss_coef=1e-3,
         output_router_logits=False,
@@ -184,8 +185,12 @@ class LlamaConfig(PretrainedConfig):
         # MoE configs
         # the total number of experts in one moe is:
         # n_routed_experts = num_fused_layer * num_experts_per_tok
-        self.num_fused_layer: int = num_fused_layer         # fuse mlps in several number of layers into one moe
+        self.num_fused_layers: int = num_fused_layers       # fuse mlps in several number of layers into one moe
         self.num_experts_per_tok: int = num_experts_per_tok # activated experts per token
+        # the total number of experts in one moe
+        # num_experts can be larger than num_experts_per_tok * num_fused_layers
+        # it's our way to implement shared experts
+        self.num_experts: int = num_experts
         self.is_converter: bool = is_converter              # with the original mlp or not
         self.router_aux_loss_coef: float = router_aux_loss_coef
         self.output_router_logits: bool = output_router_logits

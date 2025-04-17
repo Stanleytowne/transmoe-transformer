@@ -293,44 +293,9 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
-            up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
-    
-class LlamaTopkRouter(nn.Module):
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.num_fused_layer * config.num_experts_per_tok
-        self.routed_scaling_factor = config.num_experts_per_tok
 
-        self.linear = nn.Linear(config.hidden_size, self.n_routed_experts, bias=True)
-
-    def forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = self.linear.type(torch.float32)(hidden_states.type(torch.float32))
-        topk_weights, topk_indices = router_logits.topk(self.top_k, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1)
-        topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_indices, topk_weights, router_logits
     
 # copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py#L89
 class LlamaSparseMoe(nn.Module):
@@ -348,15 +313,20 @@ class LlamaSparseMoe(nn.Module):
     def __init__(self, config: LlamaConfig):
         super().__init__()
         self.hidden_dim = config.hidden_size
-        self.n_routed_experts = config.num_fused_layer * config.num_experts_per_tok
-        self.top_k = config.num_experts_per_tok
-        self.routed_scaling_factor = config.num_experts_per_tok
+        self.num_experts = config.num_experts
 
-        assert config.intermediate_size % config.num_experts_per_tok == 0, "intermediate_size must be divisible by num_experts_per_tok"
+        assert config.num_experts % config.num_fused_layers == 0, "num_experts must be divisible by num_fused_layers"
+        self.num_experts_per_layer = config.num_experts // config.num_fused_layers
+
+        self.top_k = config.num_experts_per_tok
+        self.routed_scaling_factor = self.num_experts_per_layer # scale the router logits by the number of experts per layer
+
+        assert config.intermediate_size % self.num_experts_per_layer == 0, "intermediate_size must be divisible by num_experts_per_tok"
+        self.intermediate_size = config.intermediate_size // self.num_experts_per_layer
         self.experts = nn.ModuleList(
             [
-                LlamaMLP(config, intermediate_size=config.intermediate_size // config.num_experts_per_tok)
-                for _ in range(self.n_routed_experts)
+                LlamaMLP(config, intermediate_size=self.intermediate_size)
+                for _ in range(self.num_experts)
             ]
         )
 
@@ -385,7 +355,7 @@ class LlamaSparseMoe(nn.Module):
 
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.n_routed_experts).permute(2, 1, 0)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
 
         expert_hitted = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=True)[0].tolist()
         for expert_idx in expert_hitted:
@@ -402,59 +372,6 @@ class LlamaSparseMoe(nn.Module):
             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states
-
-
-class LlamaMoE(nn.Module):
-    """
-    A mixed expert module containing shared experts.
-    """
-
-    def __init__(self, config: LlamaConfig):
-        super().__init__()
-        self.config = config
-        self.n_routed_experts = config.num_fused_layer * config.num_experts_per_tok
-
-        assert config.intermediate_size % config.num_experts_per_tok == 0, "intermediate_size must be divisible by num_experts_per_tok"
-        self.experts = nn.ModuleList(
-            [
-                LlamaMLP(config, intermediate_size=config.intermediate_size // config.num_experts_per_tok)
-                for _ in range(self.n_routed_experts)
-            ]
-        )
-        # self.gate = LlamaTopkRouter(config)
-
-    def moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
-        r"""
-        CALL FOR CONTRIBUTION! I don't have time to optimise this right now, but expert weights need to be fused
-        to not have to do a loop here (deepseek has 256 experts soooo yeah).
-        """
-        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
-        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
-        expert_mask = expert_mask.permute(2, 0, 1)
-
-        for expert_idx in range(len(self.experts)):
-            expert = self.experts[expert_idx]
-            mask = expert_mask[expert_idx]
-            token_indices, weight_indices = torch.where(mask)
-
-            if token_indices.numel() > 0:
-                expert_weights = topk_weights[token_indices, weight_indices]
-                expert_input = hidden_states[token_indices]
-                expert_output = expert(expert_input)
-                weighted_output = expert_output * expert_weights.unsqueeze(-1)
-                final_hidden_states.index_add_(0, token_indices, weighted_output)
-
-        # in original deepseek, the output of the experts are gathered once we leave this module
-        # thus the moe module is itelsf an IsolatedParallel module
-        # and all expert are "local" meaning we shard but we don't gather
-        return final_hidden_states.type(hidden_states.dtype)
-
-    def forward(self, hidden_states, topk_indices, topk_weights):
-        orig_shape = hidden_states.shape
-        # topk_indices, topk_weights = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
-        return hidden_states
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -824,14 +741,13 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.n_routed_experts = config.num_fused_layer * config.num_experts_per_tok
+        self.num_experts = config.num_experts
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         if config.is_converter:
             self.mlp = LlamaMLP(config)
-        # self.router = LlamaTopkRouter(config)
-        self.router = nn.Linear(config.hidden_size, self.n_routed_experts, bias=True)
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
 
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -893,7 +809,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        router_logits = self.router(hidden_states).view(-1, self.n_routed_experts)
+        router_logits = self.router(hidden_states).view(-1, self.num_experts)
         hidden_states = experts(hidden_states, router_logits)
         hidden_states = residual + hidden_states
 
@@ -1047,15 +963,15 @@ class LlamaModel(LlamaPreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.num_fused_layer = config.num_fused_layer
-        assert config.num_hidden_layers % config.num_fused_layer == 0
+        self.num_fused_layers = config.num_fused_layers
+        assert config.num_hidden_layers % config.num_fused_layers == 0
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.moe = nn.ModuleList(
-            [LlamaSparseMoe(config) for _ in range(config.num_hidden_layers // config.num_fused_layer)]
+            [LlamaSparseMoe(config) for _ in range(config.num_hidden_layers // config.num_fused_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -1150,7 +1066,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
-                    self.moe[i // self.num_fused_layer], 
+                    self.moe[i // self.num_fused_layers], 
                     causal_mask,
                     position_ids,
                     past_key_values,
@@ -1162,7 +1078,7 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
-                    self.moe[i // self.num_fused_layer], 
+                    self.moe[i // self.num_fused_layers], 
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
@@ -1271,89 +1187,8 @@ class LlamaModel(LlamaPreTrainedModel):
 
         return causal_mask
 
-# copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py#L185
-# def load_balancing_loss_func(
-#     gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
-#     num_experts: Optional[int] = None,
-#     top_k=2,
-#     attention_mask: Optional[torch.Tensor] = None,
-# ) -> Union[torch.Tensor, int]:
-#     r"""
-#     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-#     See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-#     function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-#     experts is too unbalanced.
-
-#     Args:
-#         gate_logits:
-#             Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-#             shape [batch_size X sequence_length, num_experts].
-#         num_experts:
-#             Number of experts
-#         top_k:
-#             The number of experts to route per-token, can be also interpreted as the `top-k` routing
-#             parameter.
-#         attention_mask (`torch.Tensor`, *optional*):
-#             The attention_mask used in forward function
-#             shape [batch_size X sequence_length] if not None.
-
-#     Returns:
-#         The auxiliary loss.
-#     """
-#     if gate_logits is None or not isinstance(gate_logits, tuple):
-#         return 0
-
-#     if isinstance(gate_logits, tuple):
-#         compute_device = gate_logits[0].device
-#         concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
-
-#     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
-#     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-#     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-#     if attention_mask is None:
-#         # Compute the percentage of tokens routed to each experts
-#         tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-#         # Compute the average probability of routing to these experts
-#         router_prob_per_expert = torch.mean(routing_weights, dim=0)
-#     else:
-#         batch_size, sequence_length = attention_mask.shape
-#         num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
-
-#         # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-#         expert_attention_mask = (
-#             attention_mask[None, :, :, None, None]
-#             .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-#             .reshape(-1, top_k, num_experts)
-#             .to(compute_device)
-#         )
-
-#         # Compute the percentage of tokens routed to each experts
-#         tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-#             expert_attention_mask, dim=0
-#         )
-
-#         # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-#         router_per_expert_attention_mask = (
-#             attention_mask[None, :, :, None]
-#             .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-#             .reshape(-1, num_experts)
-#             .to(compute_device)
-#         )
-
-#         # Compute the average probability of routing to these experts
-#         router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-#             router_per_expert_attention_mask, dim=0
-#         )
-
-#     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-#     return overall_loss * num_experts
 def load_balancing_loss_func(
-    gate_logits: torch.Tensor,
+    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
     num_experts: Optional[int] = None,
     top_k=2,
     attention_mask: Optional[torch.Tensor] = None,
@@ -1381,55 +1216,57 @@ def load_balancing_loss_func(
     Returns:
         The auxiliary loss.
     """
-    compute_device = gate_logits[0].device
-    results = torch.zeros(1).to(compute_device, gate_logits[0].dtype)
-    for gate_logit in gate_logits:
-        _, selected_experts = torch.topk(gate_logit, top_k, dim=-1)
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-        routing_weights = torch.nn.functional.softmax(gate_logit, dim=-1)
-        # routing_weights = gate_logit * expert_mask.sum(dim=1)
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
 
-        if attention_mask is None:
-            # Compute the percentage of tokens routed to each experts
-            tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
-            # Compute the average probability of routing to these experts
-            router_prob_per_expert = torch.mean(routing_weights, dim=0)
-        else:
-            batch_size, sequence_length = attention_mask.shape
-            num_hidden_layers = gate_logit.shape[0] // (batch_size * sequence_length)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
-            # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-            expert_attention_mask = (
-                attention_mask[None, :, :, None, None]
-                .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-                .reshape(-1, top_k, num_experts)
-                .to(compute_device)
-            )
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
 
-            # Compute the percentage of tokens routed to each experts
-            tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-                expert_attention_mask, dim=0
-            )
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
 
-            # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-            router_per_expert_attention_mask = (
-                attention_mask[None, :, :, None]
-                .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-                .reshape(-1, num_experts)
-                .to(compute_device)
-            )
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
 
-            # Compute the average probability of routing to these experts
-            router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-                router_per_expert_attention_mask, dim=0
-            )
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
 
-        overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-        results += overall_loss
-        
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts
-
 
 class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -1442,7 +1279,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.router_aux_loss_coef = config.router_aux_loss_coef
 
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.n_routed_expert = config.num_experts_per_tok * config.num_fused_layer
+        self.num_experts = config.num_experts
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1571,7 +1408,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
                         outputs.router_logits,
-                        self.n_routed_expert,
+                        self.num_experts,
                         self.num_experts_per_tok,
                         attention_mask,
                     )
