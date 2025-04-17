@@ -25,6 +25,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
@@ -37,6 +38,7 @@ from ...modeling_outputs import (
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
+    MoeModelOutputWithPast
 )
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from ...modeling_utils import PreTrainedModel
@@ -49,12 +51,11 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_llama import LlamaConfig
-
+from .configuration_llamamoe import LlamaMoeConfig
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "LlamaConfig"
+_CONFIG_FOR_DOC = "LlamaMoeConfig"
 
 
 def _prepare_4d_causal_attention_mask_with_cache_position(
@@ -142,7 +143,7 @@ class LlamaRotaryEmbedding(nn.Module):
         device=None,
         scaling_factor=1.0,
         rope_type="default",
-        config: Optional[LlamaConfig] = None,
+        config: Optional[LlamaMoeConfig] = None,
     ):
         super().__init__()
         # TODO (joao): remove the `if` below, only used for BC
@@ -280,37 +281,96 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1
-            )
-            up_proj = torch.cat([F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)], dim=-1)
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i]) for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
+
+    
+# copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py#L89
+class LlamaSparseMoe(nn.Module):
+    """
+    This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accommodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
+
+    def __init__(self, config: LlamaMoeConfig):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.num_experts = config.num_experts
+
+        assert config.num_experts % config.num_fused_layers == 0, "num_experts must be divisible by num_fused_layers"
+        self.num_experts_per_layer = config.num_experts // config.num_fused_layers
+
+        self.top_k = config.num_experts_per_tok
+        self.routed_scaling_factor = self.num_experts_per_layer # scale the router logits by the number of experts per layer
+
+        assert config.intermediate_size % self.num_experts_per_layer == 0, "intermediate_size must be divisible by num_experts_per_tok"
+        self.intermediate_size = config.intermediate_size // self.num_experts_per_layer
+        self.experts = nn.ModuleList(
+            [
+                LlamaMLP(config, intermediate_size=self.intermediate_size)
+                for _ in range(self.num_experts)
+            ]
+        )
+
+        # Jitter parameters
+        self.jitter_noise = config.router_jitter_noise
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """ 
+            router_logits: (batch * sequence_length, n_experts)
+        """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        if self.training and self.jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights *= self.routed_scaling_factor
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        expert_hitted = (expert_mask.sum(dim=(-1, -2)) > 0).nonzero(as_tuple=True)[0].tolist()
+        for expert_idx in expert_hitted:
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -328,7 +388,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: LlamaMoeConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -677,23 +737,27 @@ LLAMA_ATTENTION_CLASSES = {
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaMoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.num_experts = config.num_experts
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=True)
 
-        self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        experts: LlamaSparseMoe, 
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
+        output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -742,7 +806,8 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        router_logits = self.router(hidden_states).view(-1, self.num_experts)
+        hidden_states = experts(hidden_states, router_logits)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -752,6 +817,9 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        if output_router_logits:
+            outputs += (router_logits, )
 
         return outputs
 
@@ -766,7 +834,7 @@ LLAMA_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`LlamaConfig`]):
+        config ([`LlamaMoeConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -777,8 +845,8 @@ LLAMA_START_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaPreTrainedModel(PreTrainedModel):
-    config_class = LlamaConfig
+class LlamaMoePreTrainedModel(PreTrainedModel):
+    config_class = LlamaMoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -880,22 +948,27 @@ LLAMA_INPUTS_DOCSTRING = r"""
     "The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
     LLAMA_START_DOCSTRING,
 )
-class LlamaModel(LlamaPreTrainedModel):
+class LlamaMoeModel(LlamaMoePreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
     Args:
-        config: LlamaConfig
+        config: LlamaMoeConfig
     """
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaMoeConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.num_fused_layers = config.num_fused_layers
+        assert config.num_hidden_layers % config.num_fused_layers == 0
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.moe = nn.ModuleList(
+            [LlamaSparseMoe(config) for _ in range(config.num_hidden_layers // config.num_fused_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -921,9 +994,10 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -978,9 +1052,10 @@ class LlamaModel(LlamaPreTrainedModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -988,6 +1063,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
+                    self.moe[i // self.num_fused_layers], 
                     causal_mask,
                     position_ids,
                     past_key_values,
@@ -999,10 +1075,12 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    self.moe[i // self.num_fused_layers], 
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     output_attentions=output_attentions,
+                    output_router_logits=output_router_logits, 
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
@@ -1016,6 +1094,10 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+            # the router logits are always the last ones
+            if output_router_logits:
+                all_router_logits += (layer_outputs[-1],)
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -1028,11 +1110,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
+        return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            router_logits=all_router_logits
         )
 
     def _update_causal_mask(
@@ -1101,15 +1184,99 @@ class LlamaModel(LlamaPreTrainedModel):
 
         return causal_mask
 
+def load_balancing_loss_func(
+    gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
+    num_experts: Optional[int] = None,
+    top_k=2,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, int]:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
 
-class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config: LlamaMoeConfig):
         super().__init__(config)
-        self.model = LlamaModel(config)
+        self.model = LlamaMoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.num_experts = config.num_experts
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1145,10 +1312,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1180,6 +1348,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1195,6 +1367,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
             return_dict=return_dict,
             cache_position=cache_position,
         )
@@ -1228,16 +1401,30 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
 
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = load_balancing_loss_func(
+                        outputs.router_logits,
+                        self.num_experts,
+                        self.num_experts_per_tok,
+                        attention_mask,
+                    )
+            if labels is not None:
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+
         if not return_dict:
+            raise NotImplementedError("return_dict should not be False")
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return MoeCausalLMOutputWithPast(
             loss=loss,
+            aux_loss=aux_loss, 
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            router_logits=outputs.router_logits
         )
 
     def prepare_inputs_for_generation(
@@ -1314,308 +1501,92 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         )
         return model_inputs
 
-
-@add_start_docstrings(
-    """
-    The LLaMa Model transformer with a sequence classification head on top (linear layer).
-
-    [`LlamaForSequenceClassification`] uses the last token in order to do the classification, as other causal models
-    (e.g. GPT-2) do.
-
-    Since it does classification on the last token, it requires to know the position of the last token. If a
-    `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
-    no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
-    padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
-    each row of the batch).
-    """,
-    LLAMA_START_DOCSTRING,
-)
-class LlamaForSequenceClassification(LlamaPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = LlamaModel(config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+    @classmethod
+    def from_llama_pretrained(cls, 
+                              pretrained_model_name_or_path: str, 
+                              router_initialization_method: Union[str, float] = "identical", 
+                              **kwargs):
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        Load weights from a pretrained Llama model and convert to LlamaMoe model.
+        
+        Args:
+            pretrained_model_name_or_path: Path or name of the pretrained Llama model
+            router_initialization_method: Method to initialize the router weights, either "identical" or the standard deviation of the normal distribution (type: float)
+            **kwargs: Keyword arguments passed to model initialization
+            
+        Returns:
+            Converted LlamaMoe model
+        """
+        from transformers import LlamaForCausalLM
 
-        transformer_outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
-        logits = self.score(hidden_states)
+        logger.info(f"Loading weights from pretrained Llama model {pretrained_model_name_or_path} and converting to LlamaMoe model")
+        
+        # Create LlamaMoe configuration, inheriting parameters from original Llama config
+        logger.info(f"Loading LlamaMoe configuration from pretrained Llama model {pretrained_model_name_or_path}")
+        config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        assert config.architectures[0] == "LlamaForCausalLM", "The pretrained Llama model must be a LlamaForCausalLM model"
+        config.architectures[0] = "LlamaMoeForCausalLM"
 
-        if input_ids is not None:
-            batch_size = input_ids.shape[0]
-        else:
-            batch_size = inputs_embeds.shape[0]
-
-        if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-        if self.config.pad_token_id is None:
-            sequence_lengths = -1
-        else:
-            if input_ids is not None:
-                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-                sequence_lengths = sequence_lengths.to(logits.device)
+        # Load original Llama model
+        logger.info(f"Loading original Llama model from {pretrained_model_name_or_path}")
+        llama_model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, device_map="cpu")
+        
+        # Create LlamaMoe model
+        logger.info(f"Creating LlamaMoe model")
+        model = cls(config)
+        
+        # Copy shared weights
+        logger.info(f"Copying shared weights")
+        model.model.embed_tokens.weight.data = llama_model.model.embed_tokens.weight.data.clone()
+        model.lm_head.weight.data = llama_model.lm_head.weight.data.clone()
+        model.model.norm.weight.data = llama_model.model.norm.weight.data.clone()
+        
+        # Copy weights for non-MoE modules
+        logger.info(f"Copying weights for non-MoE modules")
+        for i in range(config.num_hidden_layers):
+            # Copy attention layer weights
+            model.model.layers[i].self_attn.q_proj.weight.data = llama_model.model.layers[i].self_attn.q_proj.weight.data.clone()
+            model.model.layers[i].self_attn.k_proj.weight.data = llama_model.model.layers[i].self_attn.k_proj.weight.data.clone()
+            model.model.layers[i].self_attn.v_proj.weight.data = llama_model.model.layers[i].self_attn.v_proj.weight.data.clone()
+            model.model.layers[i].self_attn.o_proj.weight.data = llama_model.model.layers[i].self_attn.o_proj.weight.data.clone()
+                
+            # Copy normalization layer weights
+            model.model.layers[i].input_layernorm.weight.data = llama_model.model.layers[i].input_layernorm.weight.data.clone()
+            model.model.layers[i].post_attention_layernorm.weight.data = llama_model.model.layers[i].post_attention_layernorm.weight.data.clone()
+        
+        # initialize moe router
+        logger.info(f"Initializing moe router")
+        for i, layer in enumerate(model.model.layers):
+            module = layer.router
+            device, dtype = module.weight.device, module.weight.dtype
+            if router_initialization_method == "identical":
+                module.weight.data = torch.zeros((config.num_experts, config.hidden_size)).to(device, dtype)
+                module.bias.data = torch.ones((config.num_experts)).to(device, dtype)
+                module.bias.data *= float('-inf')
+                start_index = (i % config.num_fused_layers) * config.num_experts // config.num_fused_layers
+                end_index = start_index + config.num_experts // config.num_fused_layers
+                module.bias.data[start_index:end_index] = 1.
+            elif type(router_initialization_method) == float:
+                module.weight.data.normal_(mean=0.0, std=router_initialization_method)
+                module.bias.data.zero_()
             else:
-                sequence_lengths = -1
+                raise ValueError(f"Invalid router initialization method: {router_initialization_method}")
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        # initialize moe experts
+        logger.info(f"Initializing moe experts")
+        for i in range(0, model.config.num_hidden_layers, config.num_fused_layers):
+            layers = llama_model.model.layers[i: i + config.num_fused_layers]
+            experts = model.model.moe[i // config.num_fused_layers].experts
+            
+            gate_proj = torch.stack([x.mlp.gate_proj.weight.data for x in layers]).view(config.num_experts, -1, config.hidden_size)
+            up_proj = torch.stack([x.mlp.up_proj.weight.data for x in layers]).view(config.num_experts, -1, config.hidden_size)
+            down_proj = torch.stack([x.mlp.down_proj.weight.data for x in layers], dim=1).view(config.hidden_size, config.num_experts, -1).transpose(0, 1)
 
-        loss = None
-        if labels is not None:
-            labels = labels.to(logits.device)
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
-
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(pooled_logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(pooled_logits, labels)
-        if not return_dict:
-            output = (pooled_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutputWithPast(
-            loss=loss,
-            logits=pooled_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-The Llama Model transformer with a span classification head on top for extractive question-answering tasks like
-SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
-    """,
-    LLAMA_START_DOCSTRING,
-)
-class LlamaForQuestionAnswering(LlamaPreTrainedModel):
-    base_model_prefix = "transformer"
-
-    # Copied from transformers.models.bloom.modeling_bloom.BloomForQuestionAnswering.__init__ with Bloom->Llama
-    def __init__(self, config):
-        super().__init__(config)
-        self.transformer = LlamaModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.transformer.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.transformer.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        start_positions: Optional[torch.LongTensor] = None,
-        end_positions: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
-            are not taken into account for computing the loss.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.transformer(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1).contiguous()
-        end_logits = end_logits.squeeze(-1).contiguous()
-
-        total_loss = None
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1).to(start_logits.device)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1).to(end_logits.device)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions = start_positions.clamp(0, ignored_index)
-            end_positions = end_positions.clamp(0, ignored_index)
-
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[2:]
-            return ((total_loss,) + output) if total_loss is not None else output
-
-        return QuestionAnsweringModelOutput(
-            loss=total_loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-
-@add_start_docstrings(
-    """
-    The Llama Model transformer with a token classification head on top (a linear layer on top of the hidden-states
-    output) e.g. for Named-Entity-Recognition (NER) tasks.
-    """,
-    LLAMA_START_DOCSTRING,
-)
-class LlamaForTokenClassification(LlamaPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.model = LlamaModel(config)
-        if getattr(config, "classifier_dropout", None) is not None:
-            classifier_dropout = config.classifier_dropout
-        elif getattr(config, "hidden_dropout", None) is not None:
-            classifier_dropout = config.hidden_dropout
-        else:
-            classifier_dropout = 0.1
-        self.dropout = nn.Dropout(classifier_dropout)
-        self.score = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, TokenClassifierOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        sequence_output = outputs[0]
-        sequence_output = self.dropout(sequence_output)
-        logits = self.score(sequence_output)
-
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-        if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
-
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+            for i in range(config.num_experts):
+                experts[i].gate_proj.weight.data = gate_proj[i].clone()
+                experts[i].up_proj.weight.data = up_proj[i].clone()
+                experts[i].down_proj.weight.data = down_proj[i].clone()
+        
+        
+        logger.info("Successfully converted pretrained Llama model to LlamaMoe model")
+        return model.to(getattr(kwargs, 'device_map', 'cpu'))

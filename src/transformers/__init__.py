@@ -524,6 +524,7 @@ _import_structure = {
     "models.levit": ["LevitConfig"],
     "models.lilt": ["LiltConfig"],
     "models.llama": ["LlamaConfig"],
+    "models.llamamoe": ["LlamaMoeConfig"],
     "models.llava": [
         "LlavaConfig",
         "LlavaProcessor",
@@ -1003,6 +1004,7 @@ else:
     _import_structure["models.gpt_sw3"].append("GPTSw3Tokenizer")
     _import_structure["models.layoutxlm"].append("LayoutXLMTokenizer")
     _import_structure["models.llama"].append("LlamaTokenizer")
+    _import_structure["models.llamamoe"].append("LlamaTokenizer")
     _import_structure["models.m2m_100"].append("M2M100Tokenizer")
     _import_structure["models.marian"].append("MarianTokenizer")
     _import_structure["models.mbart"].append("MBartTokenizer")
@@ -2537,6 +2539,13 @@ else:
             "LlamaForTokenClassification",
             "LlamaModel",
             "LlamaPreTrainedModel",
+        ]
+    )
+    _import_structure["models.llamamoe"].extend(
+        [
+            "LlamaMoeForCausalLM",
+            "LlamaMoeModel",
+            "LlamaMoePreTrainedModel",
         ]
     )
     _import_structure["models.llava"].extend(
@@ -5332,6 +5341,7 @@ if TYPE_CHECKING:
     from .models.levit import LevitConfig
     from .models.lilt import LiltConfig
     from .models.llama import LlamaConfig
+    from .models.llamamoe import LlamaMoeConfig
     from .models.llava import (
         LlavaConfig,
         LlavaProcessor,
@@ -7161,6 +7171,11 @@ if TYPE_CHECKING:
             LlamaForTokenClassification,
             LlamaModel,
             LlamaPreTrainedModel,
+        )
+        from .models.llamamoe import (
+            LlamaMoeForCausalLM,
+            LlamaMoeModel,
+            LlamaMoePreTrainedModel,
         )
         from .models.llava import (
             LlavaForConditionalGeneration,
