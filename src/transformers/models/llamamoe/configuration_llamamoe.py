@@ -170,7 +170,7 @@ class LlamaMoeConfig(LlamaConfig):
         num_experts=16,
         num_experts_per_tok=8,
         router_aux_loss_coef=1e-3,
-        output_router_logits=False,
+        output_router_logits=True,
         router_jitter_noise=0,
         **kwargs,
     ):

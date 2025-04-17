@@ -1528,7 +1528,7 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
 
         # Load original Llama model
         logger.info(f"Loading original Llama model from {pretrained_model_name_or_path}")
-        llama_model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path, device_map="cpu")
+        llama_model = LlamaForCausalLM.from_pretrained(pretrained_model_name_or_path)
         
         # Create LlamaMoe model
         model = cls(config)
