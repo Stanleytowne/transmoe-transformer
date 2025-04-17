@@ -1589,4 +1589,4 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
         
         
         logger.info("Successfully converted pretrained Llama model to LlamaMoe model")
-        return model.to(getattr(kwargs, 'device_map', 'cpu'))
+        return model.to(kwargs.get('device_map', 'cpu'))
