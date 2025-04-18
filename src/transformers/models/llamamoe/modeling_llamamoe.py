@@ -1510,8 +1510,15 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
         Load weights from a pretrained Llama model and convert to LlamaMoe model.
         
         Args:
-            pretrained_model_name_or_path: Path or name of the pretrained Llama model
-            router_initialization_method: Method to initialize the router weights, either "identical" or the standard deviation of the normal distribution (type: float)
+            pretrained_model_name_or_path (`str`):
+                Path or name of the pretrained Llama model
+            router_initialization_method (`str` or `float`):
+                Method to initialize the router weights, either "identical" or "nosharing" or the standard deviation of the normal distribution (type: float):
+                - "identical": the experts that comes from the original mlp are activated, whose bias is set to 1; otherwise, the bias is set to -inf
+                - "nosharing": `num_experts_per_tok == num_experts // num_fused_layers`, the experts that comes from the original mlp are activated, whose bias is set to 1; otherwise, the bias is set to 0  # TODO: come up with a better name
+                    - this is a "trainable" cases of the 'identical' initialization, since there's no -inf in the bias
+                    - if the model is going to be trained under downstream task, the initial value of the bias is to be set elsewhere ( e.g 1e-3 )
+                - float: the weights are initialized from a normal distribution with the given standard deviation, and the bias is set to 0
             **kwargs: Keyword arguments passed to model initialization
             
         Returns:
@@ -1563,6 +1570,13 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
                 module.weight.data = torch.zeros((config.num_experts, config.hidden_size)).to(device, dtype)
                 module.bias.data = torch.ones((config.num_experts)).to(device, dtype)
                 module.bias.data *= float('-inf')
+                start_index = (i % config.num_fused_layers) * config.num_experts // config.num_fused_layers
+                end_index = start_index + config.num_experts // config.num_fused_layers
+                module.bias.data[start_index:end_index] = 1.
+            elif router_initialization_method == "nosharing":
+                assert config.num_experts_per_tok == config.num_experts // config.num_fused_layers, "num_experts_per_tok must be equal to num_experts // num_fused_layers"
+                module.weight.data = torch.zeros((config.num_experts, config.hidden_size)).to(device, dtype)
+                module.bias.data = torch.zeros((config.num_experts)).to(device, dtype)
                 start_index = (i % config.num_fused_layers) * config.num_experts // config.num_fused_layers
                 end_index = start_index + config.num_experts // config.num_fused_layers
                 module.bias.data[start_index:end_index] = 1.
