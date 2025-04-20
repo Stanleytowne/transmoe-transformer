@@ -1505,6 +1505,8 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
     def from_llama_pretrained(cls, 
                               pretrained_model_name_or_path: str, 
                               router_initialization_method: Union[str, float] = "identical", 
+                              router_weight_std: float = 0.02,
+                              router_bias_init: float = 1e-3,
                               **kwargs):
         """
         Load weights from a pretrained Llama model and convert to LlamaMoe model.
@@ -1518,7 +1520,7 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
                 - "nosharing": `num_experts_per_tok == num_experts // num_fused_layers`, the experts that comes from the original mlp are activated, whose bias is set to 1; otherwise, the bias is set to 0  # TODO: come up with a better name
                     - this is a "trainable" cases of the 'identical' initialization, since there's no -inf in the bias
                     - if the model is going to be trained under downstream task, the initial value of the bias is to be set elsewhere ( e.g 1e-3 )
-                - float: the weights are initialized from a normal distribution with the given standard deviation, and the bias is set to 0
+                - "random": the weights are initialized from a normal distribution with the given standard deviation, and the bias is set to 0
             **kwargs: Keyword arguments passed to model initialization
             
         Returns:
@@ -1558,7 +1560,7 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
             model.model.layers[i].post_attention_layernorm.weight.data = llama_model.model.layers[i].post_attention_layernorm.weight.data.clone()
         
         # initialize moe router
-        if type(router_initialization_method) == float:
+        if router_initialization_method == "random":
             logger.warning(
                 f"Initializing moe router with standard deviation {router_initialization_method}.\nYou should probably"
                 " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
@@ -1575,13 +1577,14 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
                 module.bias.data[start_index:end_index] = 1.
             elif router_initialization_method == "nosharing":
                 assert config.num_experts_per_tok == config.num_experts // config.num_fused_layers, "num_experts_per_tok must be equal to num_experts // num_fused_layers"
+                
                 module.weight.data = torch.zeros((config.num_experts, config.hidden_size)).to(device, dtype)
                 module.bias.data = torch.zeros((config.num_experts)).to(device, dtype)
                 start_index = (i % config.num_fused_layers) * config.num_experts // config.num_fused_layers
                 end_index = start_index + config.num_experts // config.num_fused_layers
-                module.bias.data[start_index:end_index] = 1.
-            elif type(router_initialization_method) == float:
-                module.weight.data.normal_(mean=0.0, std=router_initialization_method)
+                module.bias.data[start_index:end_index] = router_bias_init
+            elif router_initialization_method == "random":
+                module.weight.data.normal_(mean=0.0, std=router_weight_std)
                 module.bias.data.zero_()
             else:
                 raise ValueError(f"Invalid router initialization method: {router_initialization_method}")
