@@ -1562,9 +1562,11 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
         # initialize moe router
         if router_initialization_method == "random":
             logger.warning(
-                f"Initializing moe router with standard deviation {router_initialization_method}.\nYou should probably"
+                f"Initializing moe router with standard deviation {router_weight_std}.\nYou should probably"
                 " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
             )
+        if router_initialization_method == "nosharing":
+            assert config.num_experts_per_tok == config.num_experts // config.num_fused_layers, "num_experts_per_tok must be equal to num_experts // num_fused_layers"
         for i, layer in enumerate(model.model.layers):
             module = layer.router
             device, dtype = module.weight.device, module.weight.dtype
@@ -1576,8 +1578,6 @@ class LlamaMoeForCausalLM(LlamaMoePreTrainedModel, GenerationMixin):
                 end_index = start_index + config.num_experts // config.num_fused_layers
                 module.bias.data[start_index:end_index] = 1.
             elif router_initialization_method == "nosharing":
-                assert config.num_experts_per_tok == config.num_experts // config.num_fused_layers, "num_experts_per_tok must be equal to num_experts // num_fused_layers"
-                
                 module.weight.data = torch.zeros((config.num_experts, config.hidden_size)).to(device, dtype)
                 module.bias.data = torch.zeros((config.num_experts)).to(device, dtype)
                 start_index = (i % config.num_fused_layers) * config.num_experts // config.num_fused_layers
